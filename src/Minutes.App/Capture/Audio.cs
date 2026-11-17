@@ -24,6 +24,7 @@ internal sealed class TrackRecorder : IDisposable
     private PcmFormat? _format;
     private StreamingResampler? _resampler;
     private bool _stopping;
+    private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
     private float _peak;
 
     public string Name { get; }
@@ -52,7 +53,7 @@ internal sealed class TrackRecorder : IDisposable
         var capture = _loopback ? new WasapiLoopbackCapture() : new WasapiCapture();
         var wave = capture.WaveFormat;
         var isFloat = wave.Encoding == WaveFormatEncoding.IeeeFloat
-            || (wave.Encoding == WaveFormatEncoding.Extensible && wave.BitsPerSample == 32);
+            || (wave is WaveFormatExtensible extensible && extensible.SubFormat == IeeeFloatSubtype);
         _format = new PcmFormat(wave.SampleRate, wave.Channels, wave.BitsPerSample, isFloat);
         _resampler = new StreamingResampler(wave.SampleRate, 16_000);
         capture.DataAvailable += OnData;
@@ -60,6 +61,28 @@ internal sealed class TrackRecorder : IDisposable
         capture.StartRecording();
         _capture = capture;
         MinutesLog.Info($"{Name}: capturing {wave.SampleRate} Hz, {wave.Channels} ch, {wave.BitsPerSample} bit, float={isFloat}");
+        LogCommunicationsDevice();
+    }
+
+    /// <summary>
+    /// Meeting apps often use the default communications device; when it differs from the default device
+    /// recorded here, one track may come out silent, so the log says so.
+    /// </summary>
+    private void LogCommunicationsDevice()
+    {
+        try
+        {
+            var flow = _loopback ? DataFlow.Render : DataFlow.Capture;
+            var console = _enumerator.GetDefaultAudioEndpoint(flow, Role.Console);
+            var communications = _enumerator.GetDefaultAudioEndpoint(flow, Role.Communications);
+            if (console.ID != communications.ID)
+            {
+                MinutesLog.Info($"{Name}: recording the default device; the communications device is a different one");
+            }
+        }
+        catch (Exception)
+        {
+        }
     }
 
     private void OnData(object? sender, WaveInEventArgs args)
@@ -183,7 +206,7 @@ internal sealed class TrackRecorder : IDisposable
     {
         public void OnDefaultDeviceChanged(DataFlow changedFlow, Role role, string defaultDeviceId)
         {
-            if (changedFlow == flow && role == Role.Console)
+            if (changedFlow == flow && role is Role.Console or Role.Multimedia)
             {
                 onChange();
             }
@@ -241,32 +264,52 @@ internal sealed class MediaFoundationExporter : IFinalAudioExporter
     {
         private const int ReadBlock = 16_000;
         private readonly StreamingResampler _resampler = new(source.SampleRate, 48_000);
-        private readonly Queue<byte> _pending = new();
+        private byte[] _pending = [];
+        private int _pendingOffset;
         private long _position;
 
         public WaveFormat WaveFormat { get; } = new(48_000, 16, 1);
 
         public int Read(byte[] buffer, int offset, int count)
         {
-            while (_pending.Count < count && _position < source.Frames)
-            {
-                var frames = source.ReadFrames(_position, ReadBlock);
-                _position += ReadBlock;
-                foreach (var sample in _resampler.Process(frames))
-                {
-                    var value = (short)Math.Round(Math.Clamp(sample, -1f, 1f) * 32767f);
-                    _pending.Enqueue((byte)(value & 0xFF));
-                    _pending.Enqueue((byte)((value >> 8) & 0xFF));
-                }
-            }
             var copied = 0;
-            while (copied < count && _pending.Count > 0)
+            while (copied < count)
             {
-                buffer[offset + copied++] = _pending.Dequeue();
+                if (_pendingOffset >= _pending.Length && !Refill())
+                {
+                    break;
+                }
+                var take = Math.Min(count - copied, _pending.Length - _pendingOffset);
+                Buffer.BlockCopy(_pending, _pendingOffset, buffer, offset + copied, take);
+                _pendingOffset += take;
+                copied += take;
             }
             return copied;
         }
 
-        public void Dispose() => _pending.Clear();
+        private bool Refill()
+        {
+            while (_position < source.Frames)
+            {
+                var samples = _resampler.Process(source.ReadFrames(_position, ReadBlock));
+                _position += ReadBlock;
+                if (samples.Length == 0)
+                {
+                    continue;
+                }
+                _pending = new byte[samples.Length * 2];
+                for (var i = 0; i < samples.Length; i++)
+                {
+                    var value = (short)Math.Round(Math.Clamp(samples[i], -1f, 1f) * 32767f);
+                    _pending[i * 2] = (byte)(value & 0xFF);
+                    _pending[i * 2 + 1] = (byte)((value >> 8) & 0xFF);
+                }
+                _pendingOffset = 0;
+                return true;
+            }
+            return false;
+        }
+
+        public void Dispose() => _pending = [];
     }
 }

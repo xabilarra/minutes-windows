@@ -51,12 +51,15 @@ internal sealed class RecordingCoordinator : IDisposable
 
     public void Start(bool autoDetect = true)
     {
-        if (autoDetect)
-        {
-            _timer.Start();
-        }
         LoadLastMeeting();
-        Task.Run(_pipeline.ResumePending);
+        // Detection starts only after the pending scan, so a new recording is never queued half-written.
+        Task.Run(_pipeline.ResumePending).ContinueWith(_ => OnUi(() =>
+        {
+            if (autoDetect)
+            {
+                _timer.Start();
+            }
+        }));
     }
 
     public void ReloadSettings()

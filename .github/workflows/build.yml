@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -43,12 +47,27 @@ jobs:
           name: Minutes-win-x64
           path: artifacts/Minutes.exe
 
-      - name: Publish the "latest" release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: pwsh
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Minutes-win-x64
+
+      - name: Replace the "latest" release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          $notes = "Build of ${{ github.sha }}. Download Minutes.exe and open it: see the README for first-run steps."
-          gh release delete latest --yes --cleanup-tag 2>$null
-          gh release create latest artifacts/Minutes.exe --title "Minutes for Windows (latest build)" --notes $notes --prerelease --target ${{ github.sha }}
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest Minutes.exe --title "Minutes for Windows (latest build)" \
+            --notes "Build of $SHA. Download Minutes.exe and open it: see the README for first-run steps." \
+            --prerelease --target "$SHA"

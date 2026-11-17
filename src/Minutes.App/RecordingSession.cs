@@ -47,6 +47,14 @@ internal sealed class RecordingSession
         session.StartTrack("Ellos (audio del PC)", MeetingFile.SystemRaw, loopback: true);
         if (session._tracks.Count == 0)
         {
+            // Nothing was recorded: leave no folder behind for the pipeline to "transcribe".
+            try
+            {
+                Directory.Delete(folder, recursive: true);
+            }
+            catch (Exception)
+            {
+            }
             throw new InvalidOperationException(string.Join(" ", session.Warnings));
         }
         MinutesLog.Info($"Recording started ({trigger}, {appName})");
@@ -86,6 +94,7 @@ internal sealed class RecordingSession
             try
             {
                 track.Stop(total);
+                track.Dispose();
             }
             catch (Exception error)
             {
