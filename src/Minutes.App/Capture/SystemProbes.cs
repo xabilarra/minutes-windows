@@ -197,3 +197,95 @@ internal static class WindowCatalog
         public static extern int DwmGetWindowAttribute(IntPtr handle, int attribute, out int value, int size);
     }
 }
+
+/// <summary>Process ids of an app and every process it started (Teams' WebView2 children, Chrome's audio service).</summary>
+internal static class ProcessTree
+{
+    public static HashSet<uint> Of(IReadOnlyCollection<string> executableNames)
+    {
+        var result = new HashSet<uint>();
+        if (executableNames.Count == 0)
+        {
+            return result;
+        }
+        var processes = Snapshot();
+        foreach (var (pid, (_, name)) in processes)
+        {
+            if (executableNames.Contains(name))
+            {
+                result.Add(pid);
+            }
+        }
+        // Children may appear in any order: repeat until nothing new joins.
+        bool added;
+        do
+        {
+            added = false;
+            foreach (var (pid, (parent, _)) in processes)
+            {
+                if (!result.Contains(pid) && result.Contains(parent) && pid != parent)
+                {
+                    result.Add(pid);
+                    added = true;
+                }
+            }
+        } while (added);
+        return result;
+    }
+
+    private static Dictionary<uint, (uint Parent, string Name)> Snapshot()
+    {
+        var processes = new Dictionary<uint, (uint, string)>();
+        var snapshot = Native.CreateToolhelp32Snapshot(Native.SnapProcess, 0);
+        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
+        {
+            return processes;
+        }
+        try
+        {
+            var entry = new Native.ProcessEntry { Size = (uint)Marshal.SizeOf<Native.ProcessEntry>() };
+            for (var ok = Native.Process32FirstW(snapshot, ref entry); ok; ok = Native.Process32NextW(snapshot, ref entry))
+            {
+                processes[entry.ProcessId] = (entry.ParentProcessId, entry.ExeFile.ToLowerInvariant());
+            }
+        }
+        finally
+        {
+            Native.CloseHandle(snapshot);
+        }
+        return processes;
+    }
+
+    private static class Native
+    {
+        public const uint SnapProcess = 0x00000002;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct ProcessEntry
+        {
+            public uint Size;
+            public uint Usage;
+            public uint ProcessId;
+            public IntPtr DefaultHeapId;
+            public uint ModuleId;
+            public uint Threads;
+            public uint ParentProcessId;
+            public int PriorityClassBase;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string ExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool Process32FirstW(IntPtr snapshot, ref ProcessEntry entry);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool Process32NextW(IntPtr snapshot, ref ProcessEntry entry);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+}

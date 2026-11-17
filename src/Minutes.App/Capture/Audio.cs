@@ -35,10 +35,13 @@ internal sealed class TrackRecorder : IDisposable
     private readonly uint _ownProcessId = (uint)Environment.ProcessId;
     private System.Threading.Timer? _scanTimer;
     private System.Threading.Timer? _flushTimer;
-    private bool _stopping;
+    private volatile bool _stopping;
     private float _peak;
     private bool _warnedNothing;
-    private int _scanning;
+    private readonly IReadOnlyCollection<string> _appProcesses;
+    /// <summary>Held by whoever scans; Stop takes it so no scan runs once stopping begins.</summary>
+    private readonly SemaphoreSlim _scanGate = new(1, 1);
+    private readonly Dictionary<string, DateTime> _lastDeviceError = [];
 
     public string Name { get; }
     public long FramesWritten => _writer.FramesWritten;
@@ -50,9 +53,14 @@ internal sealed class TrackRecorder : IDisposable
     /// When no other app is using a device, record the default communications device (call apps)
     /// instead of the default device.
     /// </param>
-    public TrackRecorder(string name, string path, bool loopback, bool communications, Stopwatch clock)
+    /// <param name="appProcesses">
+    /// Lowercase exe names of the meeting app (null for a manual recording): the devices its process tree
+    /// uses win over everything else, so another app's microphone or a noise-suppression chain is not mixed in.
+    /// </param>
+    public TrackRecorder(string name, string path, bool loopback, bool communications, IReadOnlyCollection<string>? appProcesses, Stopwatch clock)
     {
         Name = name;
+        _appProcesses = appProcesses ?? [];
         _loopback = loopback;
         _fallbackRole = communications ? Role.Communications : Role.Console;
         _clock = clock;
@@ -62,7 +70,9 @@ internal sealed class TrackRecorder : IDisposable
     /// <summary>Starts on the devices in use now; throws when no device can be recorded at all.</summary>
     public void Start()
     {
-        Task.Run(Scan).GetAwaiter().GetResult();
+        // The first scan reports a total failure by throwing, not through Failed as well.
+        _warnedNothing = true;
+        Task.Run(SafeScan).GetAwaiter().GetResult();
         lock (_lock)
         {
             if (_captures.Count == 0)
@@ -76,14 +86,17 @@ internal sealed class TrackRecorder : IDisposable
 
     private void SafeScan()
     {
-        // Timer callbacks can overlap when a scan is slow; one at a time.
-        if (Interlocked.Exchange(ref _scanning, 1) == 1)
+        // One scan at a time, and none once Stop holds the gate.
+        if (!_scanGate.Wait(0))
         {
             return;
         }
         try
         {
-            Scan();
+            if (!_stopping)
+            {
+                Scan();
+            }
         }
         catch (Exception error)
         {
@@ -91,7 +104,7 @@ internal sealed class TrackRecorder : IDisposable
         }
         finally
         {
-            Volatile.Write(ref _scanning, 0);
+            _scanGate.Release();
         }
     }
 
@@ -160,7 +173,7 @@ internal sealed class TrackRecorder : IDisposable
             }
             catch (Exception error)
             {
-                MinutesLog.Error($"{Name}: could not open \"{device.FriendlyName}\": {error.GetType().Name}: {error.Message}");
+                LogDeviceError(id, $"{Name}: could not open \"{device.FriendlyName}\": {error.GetType().Name}: {error.Message}");
                 lock (_lock)
                 {
                     if (started is not null && _captures.TryGetValue(id, out var current) && current == started)
@@ -189,43 +202,75 @@ internal sealed class TrackRecorder : IDisposable
         }
     }
 
-    /// <summary>Device id → device for every endpoint this track should record now.</summary>
+    /// <summary>
+    /// Device id → device for every endpoint this track should record now, in order of preference:
+    /// 1. the devices the meeting app's process tree is streaming on (Active), or keeps open while muted (Inactive);
+    /// 2. otherwise the devices any other app is streaming on, plus (speakers) the default outputs;
+    /// 3. otherwise the default device (microphone: communications for call apps).
+    /// </summary>
     private Dictionary<string, MMDevice> WantedDevices()
     {
         var flow = _loopback ? DataFlow.Render : DataFlow.Capture;
-        var wanted = new Dictionary<string, MMDevice>();
         _enumerator ??= new MMDeviceEnumerator();
+        var appTree = ProcessTree.Of(_appProcesses);
+        var appActive = new Dictionary<string, MMDevice>();
+        var appInactive = new Dictionary<string, MMDevice>();
+        var othersActive = new Dictionary<string, MMDevice>();
         foreach (var device in _enumerator.EnumerateAudioEndPoints(flow, DeviceState.Active))
         {
-            if (IsUsedByAnotherApp(device))
+            foreach (var (processId, state) in Sessions(device))
             {
-                wanted[device.ID] = device;
-            }
-        }
-        // Speakers: the default output is always recorded. Microphone: the default input only when no app uses one.
-        if (_loopback || wanted.Count == 0)
-        {
-            try
-            {
-                var fallback = _enumerator.GetDefaultAudioEndpoint(flow, _loopback ? Role.Console : _fallbackRole);
-                wanted.TryAdd(fallback.ID, fallback);
-                if (_loopback && _fallbackRole == Role.Communications)
+                if (processId == _ownProcessId)
                 {
-                    var communications = _enumerator.GetDefaultAudioEndpoint(flow, Role.Communications);
-                    wanted.TryAdd(communications.ID, communications);
+                    continue;
+                }
+                var isApp = appTree.Contains(processId);
+                if (isApp && state == AudioSessionState.AudioSessionStateActive)
+                {
+                    appActive[device.ID] = device;
+                }
+                else if (isApp && state == AudioSessionState.AudioSessionStateInactive)
+                {
+                    appInactive[device.ID] = device;
+                }
+                else if (state == AudioSessionState.AudioSessionStateActive)
+                {
+                    othersActive[device.ID] = device;
                 }
             }
-            catch (Exception)
+        }
+        if (appActive.Count > 0)
+        {
+            return appActive;
+        }
+        if (appInactive.Count > 0)
+        {
+            return appInactive;
+        }
+        var wanted = othersActive;
+        // Speakers: the default outputs always count. Microphone: the default input only when no app uses one.
+        if (_loopback || wanted.Count == 0)
+        {
+            foreach (var role in _loopback ? new[] { Role.Console, _fallbackRole } : [_fallbackRole])
             {
-                // No default device (none plugged in): nothing to add.
+                try
+                {
+                    var fallback = _enumerator.GetDefaultAudioEndpoint(flow, role);
+                    wanted.TryAdd(fallback.ID, fallback);
+                }
+                catch (Exception)
+                {
+                    // No default device (none plugged in): nothing to add.
+                }
             }
         }
         return wanted;
     }
 
-    /// <summary>True when an app other than Minutes has an active audio stream on the device.</summary>
-    private bool IsUsedByAnotherApp(MMDevice device)
+    /// <summary>Process id and state of every non-system audio session on the device.</summary>
+    private List<(uint ProcessId, AudioSessionState State)> Sessions(MMDevice device)
     {
+        var result = new List<(uint, AudioSessionState)>();
         try
         {
             var manager = device.AudioSessionManager;
@@ -234,19 +279,31 @@ internal sealed class TrackRecorder : IDisposable
             for (var i = 0; i < sessions.Count; i++)
             {
                 var session = sessions[i];
-                if (session.State == AudioSessionState.AudioSessionStateActive
-                    && !session.IsSystemSoundsSession
-                    && session.GetProcessID != _ownProcessId)
+                if (!session.IsSystemSoundsSession)
                 {
-                    return true;
+                    result.Add((session.GetProcessID, session.State));
                 }
             }
         }
         catch (Exception error)
         {
-            MinutesLog.Error($"{Name}: reading sessions of \"{device.FriendlyName}\" failed: {error.GetType().Name}");
+            LogDeviceError(device.ID, $"{Name}: reading sessions of \"{device.FriendlyName}\" failed: {error.GetType().Name}");
         }
-        return false;
+        return result;
+    }
+
+    /// <summary>At most one log line per device and minute, so a broken device does not flood the log.</summary>
+    private void LogDeviceError(string deviceId, string message)
+    {
+        lock (_lastDeviceError)
+        {
+            if (_lastDeviceError.TryGetValue(deviceId, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(1))
+            {
+                return;
+            }
+            _lastDeviceError[deviceId] = DateTime.UtcNow;
+        }
+        MinutesLog.Error(message);
     }
 
     private void OnSamples(DeviceCapture capture, float[] samples)
@@ -304,6 +361,8 @@ internal sealed class TrackRecorder : IDisposable
         }
         _scanTimer?.Dispose();
         _flushTimer?.Dispose();
+        // Wait for a scan already running (it may be opening a device) before releasing the devices.
+        _scanGate.Wait();
         // Disposed outside the lock: disposing joins each capture thread, which may be waiting for it.
         foreach (var capture in captures)
         {

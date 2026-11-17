@@ -27,7 +27,7 @@ internal sealed class RecordingSession
     /// <summary>Creates the meeting folder and starts both tracks; throws when neither track can record.</summary>
     public static RecordingSession Start(
         string appName, string? appKey, string? windowTitle, string? title, string trigger, string root, bool communications,
-        Action<string> onTrackFailed)
+        IReadOnlyCollection<string>? appProcesses, Action<string> onTrackFailed)
     {
         Directory.CreateDirectory(root);
         var startedAt = DateTimeOffset.Now;
@@ -46,8 +46,8 @@ internal sealed class RecordingSession
         MetadataStore.Write(metadata, folder);
 
         var session = new RecordingSession(folder, metadata) { _onTrackFailed = onTrackFailed };
-        session.StartTrack("Yo (micrófono)", MeetingFile.MicRaw, loopback: false, communications);
-        session.StartTrack("Ellos (audio del PC)", MeetingFile.SystemRaw, loopback: true, communications);
+        session.StartTrack("Yo (micrófono)", MeetingFile.MicRaw, loopback: false, communications, appProcesses);
+        session.StartTrack("Ellos (audio del PC)", MeetingFile.SystemRaw, loopback: true, communications, appProcesses);
         if (session._tracks.Count == 0)
         {
             // Nothing was recorded: leave no folder behind for the pipeline to "transcribe".
@@ -64,12 +64,12 @@ internal sealed class RecordingSession
         return session;
     }
 
-    private void StartTrack(string name, string file, bool loopback, bool communications)
+    private void StartTrack(string name, string file, bool loopback, bool communications, IReadOnlyCollection<string>? appProcesses)
     {
         TrackRecorder? track = null;
         try
         {
-            track = new TrackRecorder(name, Path.Combine(Folder, file), loopback, communications, _clock);
+            track = new TrackRecorder(name, Path.Combine(Folder, file), loopback, communications, appProcesses, _clock);
             track.Failed += message => _onTrackFailed(message);
             track.Start();
             _tracks.Add(track);
