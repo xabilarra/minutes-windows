@@ -8,145 +8,290 @@ using NAudio.Wave;
 namespace Minutes.App.Capture;
 
 /// <summary>
-/// Records one track (microphone or everything the PC plays) to a 16 kHz mono WAV aligned on the session
-/// clock. Follows the default device: plugging headphones in restarts capture on the new device, and
-/// the gap is filled with silence so both tracks keep one timeline.
+/// Records one track (microphone or what the PC plays) to a 16 kHz mono WAV on the session clock, without
+/// depending on which device is configured: every 2 s it looks at which devices other apps are using
+/// right now (their active audio sessions) and records all of them, mixed. Microphone: the inputs some
+/// other app is capturing (Teams, Chrome…), or the default one when none is. Speakers: every output an
+/// app is playing to, plus the default output. Devices that appear mid-call (headphones) are added.
 /// </summary>
 internal sealed class TrackRecorder : IDisposable
 {
+    private const int ScanMilliseconds = 2000;
+    private const int FlushMilliseconds = 500;
+    /// <summary>How far behind the clock the mix is written, so late packets still land in it.</summary>
+    private const double MixLatency = 1.0;
+    /// <summary>A device nobody else uses any more keeps recording this long before it is dropped.</summary>
+    private static readonly TimeSpan UnusedGrace = TimeSpan.FromSeconds(10);
+
     private readonly bool _loopback;
-    private readonly Role _role;
+    private readonly Role _fallbackRole;
     private readonly Stopwatch _clock;
-    private readonly AlignedTrackWriter _writer;
+    private readonly WavWriter _writer;
+    private readonly TrackMixer _mixer = new();
     private readonly object _lock = new();
-    private readonly MMDeviceEnumerator _enumerator = new();
-    private readonly DeviceChangeListener _listener;
-    private WasapiCapture? _capture;
-    private PcmFormat? _format;
-    private StreamingResampler? _resampler;
+    private readonly Dictionary<string, DeviceCapture> _captures = [];
+    /// <summary>Created and used only on thread-pool (MTA) threads, like every capture.</summary>
+    private MMDeviceEnumerator? _enumerator;
+    private readonly uint _ownProcessId = (uint)Environment.ProcessId;
+    private System.Threading.Timer? _scanTimer;
+    private System.Threading.Timer? _flushTimer;
     private bool _stopping;
-    private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
     private float _peak;
+    private bool _warnedNothing;
+    private int _scanning;
 
     public string Name { get; }
     public long FramesWritten => _writer.FramesWritten;
 
-    /// <summary>Raised (on a worker thread) when the track stopped recording for good.</summary>
+    /// <summary>Raised (on a worker thread) when the track has no device it can record.</summary>
     public event Action<string>? Failed;
 
     /// <param name="communications">
-    /// Record the default communications device (what Teams, Zoom and other call apps use by default)
-    /// instead of the default device (what browsers use).
+    /// When no other app is using a device, record the default communications device (call apps)
+    /// instead of the default device.
     /// </param>
     public TrackRecorder(string name, string path, bool loopback, bool communications, Stopwatch clock)
     {
         Name = name;
         _loopback = loopback;
-        _role = communications ? Role.Communications : Role.Console;
+        _fallbackRole = communications ? Role.Communications : Role.Console;
         _clock = clock;
-        _writer = new AlignedTrackWriter(path);
-        _listener = new DeviceChangeListener(loopback ? DataFlow.Render : DataFlow.Capture, _role, () => Task.Run(Restart));
+        _writer = new WavWriter(path, 16_000);
     }
 
+    /// <summary>Starts on the devices in use now; throws when no device can be recorded at all.</summary>
     public void Start()
     {
+        Task.Run(Scan).GetAwaiter().GetResult();
         lock (_lock)
         {
-            StartCapture();
+            if (_captures.Count == 0)
+            {
+                throw new InvalidOperationException("no audio device could be opened");
+            }
         }
-        _enumerator.RegisterEndpointNotificationCallback(_listener);
+        _scanTimer = new System.Threading.Timer(_ => SafeScan(), null, ScanMilliseconds, ScanMilliseconds);
+        _flushTimer = new System.Threading.Timer(_ => Flush(_clock.Elapsed.TotalSeconds - MixLatency), null, FlushMilliseconds, FlushMilliseconds);
     }
 
-    private void StartCapture()
+    private void SafeScan()
     {
-        var device = _enumerator.GetDefaultAudioEndpoint(_loopback ? DataFlow.Render : DataFlow.Capture, _role);
-        WasapiCapture capture = _loopback ? new WasapiLoopbackCapture(device) : new WasapiCapture(device);
-        var wave = capture.WaveFormat;
-        var isFloat = wave.Encoding == WaveFormatEncoding.IeeeFloat
-            || (wave is WaveFormatExtensible extensible && extensible.SubFormat == IeeeFloatSubtype);
-        _format = new PcmFormat(wave.SampleRate, wave.Channels, wave.BitsPerSample, isFloat);
-        _resampler = new StreamingResampler(wave.SampleRate, 16_000);
-        capture.DataAvailable += OnData;
-        capture.RecordingStopped += OnStopped;
-        capture.StartRecording();
-        _capture = capture;
-        MinutesLog.Info($"{Name}: capturing \"{device.FriendlyName}\" ({_role}) at {wave.SampleRate} Hz, {wave.Channels} ch, {wave.BitsPerSample} bit, float={isFloat}");
-    }
-
-    private void OnData(object? sender, WaveInEventArgs args)
-    {
-        lock (_lock)
+        // Timer callbacks can overlap when a scan is slow; one at a time.
+        if (Interlocked.Exchange(ref _scanning, 1) == 1)
         {
-            if (sender != _capture || _format is null || _resampler is null || args.BytesRecorded == 0)
-            {
-                return;
-            }
-            var mono = PcmConverter.ToMono(args.Buffer.AsSpan(0, args.BytesRecorded), _format);
-            var samples = _resampler.Process(mono);
-            foreach (var sample in samples)
-            {
-                _peak = Math.Max(_peak, Math.Abs(sample));
-            }
-            _writer.Append(samples, _clock.Elapsed.TotalSeconds);
+            return;
         }
-    }
-
-    private void OnStopped(object? sender, StoppedEventArgs args)
-    {
-        if (args.Exception is not null)
+        try
         {
-            MinutesLog.Error($"{Name}: capture stopped: {args.Exception.GetType().Name}: {args.Exception.Message}");
-            if (!_stopping && sender == _capture)
-            {
-                _ = Task.Run(Restart);
-            }
+            Scan();
+        }
+        catch (Exception error)
+        {
+            MinutesLog.Error($"{Name}: device scan failed: {error.GetType().Name}: {error.Message}");
+        }
+        finally
+        {
+            Volatile.Write(ref _scanning, 0);
         }
     }
 
-    private void Restart()
+    /// <summary>Adds captures for the devices in use, drops the ones nobody has used for a while.</summary>
+    private void Scan()
     {
-        WasapiCapture? old;
+        var wanted = WantedDevices();
+        var now = DateTime.UtcNow;
+        var toStop = new List<DeviceCapture>();
         lock (_lock)
         {
             if (_stopping)
             {
                 return;
             }
-            old = _capture;
-            _capture = null;
-        }
-        MinutesLog.Info($"{Name}: default device changed, restarting capture");
-        // Disposed outside the lock: disposing joins the capture thread, which may be waiting for it in OnData.
-        DisposeCapture(old);
-        // The new endpoint is often not ready when the notification fires: retry before giving up.
-        int[] delays = [0, 1000, 2000, 4000, 8000];
-        foreach (var delay in delays)
-        {
-            Thread.Sleep(delay);
-            lock (_lock)
+            foreach (var capture in _captures.Values)
             {
-                if (_stopping || _capture is not null)
+                if (wanted.ContainsKey(capture.DeviceId))
                 {
-                    return;
+                    capture.LastWanted = now;
                 }
-                try
+            }
+            foreach (var (id, capture) in _captures.ToList())
+            {
+                // A failed device always goes; an unused one only while another device keeps recording.
+                var unused = now - capture.LastWanted > UnusedGrace;
+                if (capture.HasFailed || (unused && _captures.Count > 1))
                 {
-                    StartCapture();
-                    return;
-                }
-                catch (Exception error)
-                {
-                    MinutesLog.Error($"{Name}: restart failed: {error.GetType().Name}: {error.Message}");
+                    _captures.Remove(id);
+                    _mixer.RemoveSource(capture.Source);
+                    toStop.Add(capture);
                 }
             }
         }
-        Failed?.Invoke($"Se ha dejado de grabar {Name} tras cambiar de dispositivo de audio.");
+        foreach (var capture in toStop)
+        {
+            MinutesLog.Info($"{Name}: stopped recording \"{capture.DeviceName}\"{(capture.HasFailed ? " (device failed)" : "")}");
+            capture.Dispose();
+        }
+        foreach (var (id, device) in wanted)
+        {
+            lock (_lock)
+            {
+                if (_stopping || _captures.ContainsKey(id))
+                {
+                    continue;
+                }
+            }
+            DeviceCapture? started = null;
+            try
+            {
+                started = new DeviceCapture(device, _loopback, this);
+                lock (_lock)
+                {
+                    if (_stopping)
+                    {
+                        break;
+                    }
+                    started.Source = _mixer.AddSource();
+                    started.LastWanted = now;
+                    _captures[id] = started;
+                }
+                started.Start();
+                MinutesLog.Info($"{Name}: recording \"{started.DeviceName}\" at {started.Format.SampleRate} Hz, {started.Format.Channels} ch, float={started.Format.IsFloat}");
+                started = null;
+            }
+            catch (Exception error)
+            {
+                MinutesLog.Error($"{Name}: could not open \"{device.FriendlyName}\": {error.GetType().Name}: {error.Message}");
+                lock (_lock)
+                {
+                    if (started is not null && _captures.TryGetValue(id, out var current) && current == started)
+                    {
+                        _captures.Remove(id);
+                        _mixer.RemoveSource(started.Source);
+                    }
+                }
+            }
+            finally
+            {
+                started?.Dispose();
+            }
+        }
+        lock (_lock)
+        {
+            if (_captures.Count == 0 && !_stopping && !_warnedNothing)
+            {
+                _warnedNothing = true;
+                Failed?.Invoke($"No se puede grabar {Name}: no hay ningún dispositivo de audio disponible.");
+            }
+            else if (_captures.Count > 0)
+            {
+                _warnedNothing = false;
+            }
+        }
     }
 
-    /// <summary>Stops capturing and pads the track to the session length.</summary>
+    /// <summary>Device id → device for every endpoint this track should record now.</summary>
+    private Dictionary<string, MMDevice> WantedDevices()
+    {
+        var flow = _loopback ? DataFlow.Render : DataFlow.Capture;
+        var wanted = new Dictionary<string, MMDevice>();
+        _enumerator ??= new MMDeviceEnumerator();
+        foreach (var device in _enumerator.EnumerateAudioEndPoints(flow, DeviceState.Active))
+        {
+            if (IsUsedByAnotherApp(device))
+            {
+                wanted[device.ID] = device;
+            }
+        }
+        // Speakers: the default output is always recorded. Microphone: the default input only when no app uses one.
+        if (_loopback || wanted.Count == 0)
+        {
+            try
+            {
+                var fallback = _enumerator.GetDefaultAudioEndpoint(flow, _loopback ? Role.Console : _fallbackRole);
+                wanted.TryAdd(fallback.ID, fallback);
+                if (_loopback && _fallbackRole == Role.Communications)
+                {
+                    var communications = _enumerator.GetDefaultAudioEndpoint(flow, Role.Communications);
+                    wanted.TryAdd(communications.ID, communications);
+                }
+            }
+            catch (Exception)
+            {
+                // No default device (none plugged in): nothing to add.
+            }
+        }
+        return wanted;
+    }
+
+    /// <summary>True when an app other than Minutes has an active audio stream on the device.</summary>
+    private bool IsUsedByAnotherApp(MMDevice device)
+    {
+        try
+        {
+            var manager = device.AudioSessionManager;
+            manager.RefreshSessions();
+            var sessions = manager.Sessions;
+            for (var i = 0; i < sessions.Count; i++)
+            {
+                var session = sessions[i];
+                if (session.State == AudioSessionState.AudioSessionStateActive
+                    && !session.IsSystemSoundsSession
+                    && session.GetProcessID != _ownProcessId)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            MinutesLog.Error($"{Name}: reading sessions of \"{device.FriendlyName}\" failed: {error.GetType().Name}");
+        }
+        return false;
+    }
+
+    private void OnSamples(DeviceCapture capture, float[] samples)
+    {
+        lock (_lock)
+        {
+            if (_stopping || !_captures.ContainsValue(capture))
+            {
+                return;
+            }
+            foreach (var sample in samples)
+            {
+                _peak = Math.Max(_peak, Math.Abs(sample));
+            }
+            _mixer.Append(capture.Source, samples, _clock.Elapsed.TotalSeconds);
+        }
+    }
+
+    private void Flush(double upTo)
+    {
+        try
+        {
+            lock (_lock)
+            {
+                if (_stopping)
+                {
+                    return;
+                }
+                var mixed = _mixer.Take(upTo);
+                if (mixed.Length > 0)
+                {
+                    _writer.Write(mixed);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            MinutesLog.Error($"{Name}: writing failed: {error.GetType().Name}: {error.Message}");
+        }
+    }
+
+    /// <summary>Stops every capture and writes the track up to the session end.</summary>
     public void Stop(double totalElapsed)
     {
-        WasapiCapture? old;
+        List<DeviceCapture> captures;
         lock (_lock)
         {
             if (_stopping)
@@ -154,67 +299,104 @@ internal sealed class TrackRecorder : IDisposable
                 return;
             }
             _stopping = true;
-            old = _capture;
-            _capture = null;
+            captures = [.. _captures.Values];
+            _captures.Clear();
         }
-        try
+        _scanTimer?.Dispose();
+        _flushTimer?.Dispose();
+        // Disposed outside the lock: disposing joins each capture thread, which may be waiting for it.
+        foreach (var capture in captures)
         {
-            _enumerator.UnregisterEndpointNotificationCallback(_listener);
+            capture.Dispose();
         }
-        catch (Exception)
-        {
-        }
-        DisposeCapture(old);
         lock (_lock)
         {
-            _writer.Finish(totalElapsed);
+            var rest = _mixer.Take(totalElapsed);
+            if (rest.Length > 0)
+            {
+                _writer.Write(rest);
+            }
             _writer.Dispose();
         }
         MinutesLog.Info($"{Name}: stopped, {FramesWritten / 16_000.0:F1} s, peak {(_peak > 0 ? 20 * Math.Log10(_peak) : -160):F0} dBFS");
     }
 
-    private void DisposeCapture(WasapiCapture? capture)
-    {
-        if (capture is null)
-        {
-            return;
-        }
-        capture.DataAvailable -= OnData;
-        try
-        {
-            capture.StopRecording();
-            capture.Dispose();
-        }
-        catch (Exception error)
-        {
-            MinutesLog.Error($"{Name}: releasing the device failed: {error.GetType().Name}");
-        }
-    }
-
     public void Dispose()
     {
         Stop(_clock.Elapsed.TotalSeconds);
-        _enumerator.Dispose();
+        _enumerator?.Dispose();
     }
 
-    /// <summary>Calls back when the recorded default device (direction and role) changes.</summary>
-    private sealed class DeviceChangeListener(DataFlow flow, Role recordedRole, Action onChange) : IMMNotificationClient
+    /// <summary>One WASAPI capture of one device, resampled to 16 kHz mono.</summary>
+    private sealed class DeviceCapture : IDisposable
     {
-        public void OnDefaultDeviceChanged(DataFlow changedFlow, Role role, string defaultDeviceId)
+        private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
+
+        private readonly WasapiCapture _capture;
+        private readonly StreamingResampler _resampler;
+        private readonly TrackRecorder _owner;
+
+        public string DeviceId { get; }
+        public string DeviceName { get; }
+        public PcmFormat Format { get; }
+        public int Source { get; set; }
+        public DateTime LastWanted { get; set; }
+        public bool HasFailed { get; private set; }
+
+        public DeviceCapture(MMDevice device, bool loopback, TrackRecorder owner)
         {
-            var matches = recordedRole == Role.Communications
-                ? role == Role.Communications
-                : role is Role.Console or Role.Multimedia;
-            if (changedFlow == flow && matches)
+            _owner = owner;
+            DeviceId = device.ID;
+            DeviceName = device.FriendlyName;
+            _capture = loopback ? new WasapiLoopbackCapture(device) : new WasapiCapture(device);
+            var wave = _capture.WaveFormat;
+            var isFloat = wave.Encoding == WaveFormatEncoding.IeeeFloat
+                || (wave is WaveFormatExtensible extensible && extensible.SubFormat == IeeeFloatSubtype);
+            Format = new PcmFormat(wave.SampleRate, wave.Channels, wave.BitsPerSample, isFloat);
+            _resampler = new StreamingResampler(wave.SampleRate, 16_000);
+            _capture.DataAvailable += OnData;
+            _capture.RecordingStopped += OnStopped;
+        }
+
+        public void Start() => _capture.StartRecording();
+
+        private void OnData(object? sender, WaveInEventArgs args)
+        {
+            if (args.BytesRecorded == 0)
             {
-                onChange();
+                return;
+            }
+            float[] samples;
+            lock (_resampler)
+            {
+                samples = _resampler.Process(PcmConverter.ToMono(args.Buffer.AsSpan(0, args.BytesRecorded), Format));
+            }
+            _owner.OnSamples(this, samples);
+        }
+
+        private void OnStopped(object? sender, StoppedEventArgs args)
+        {
+            if (args.Exception is not null)
+            {
+                // Unplugged or invalidated: the next scan drops it and records whatever is in use instead.
+                HasFailed = true;
+                MinutesLog.Error($"\"{DeviceName}\" stopped: {args.Exception.GetType().Name}: {args.Exception.Message}");
             }
         }
 
-        public void OnDeviceStateChanged(string deviceId, DeviceState newState) { }
-        public void OnDeviceAdded(string pwstrDeviceId) { }
-        public void OnDeviceRemoved(string deviceId) { }
-        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) { }
+        public void Dispose()
+        {
+            _capture.DataAvailable -= OnData;
+            try
+            {
+                _capture.StopRecording();
+                _capture.Dispose();
+            }
+            catch (Exception error)
+            {
+                MinutesLog.Error($"Releasing \"{DeviceName}\" failed: {error.GetType().Name}");
+            }
+        }
     }
 }
 

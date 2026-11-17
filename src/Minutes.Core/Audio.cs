@@ -412,3 +412,75 @@ public sealed class WavFile
         return rms > 0 ? Math.Max(SilenceDb, 20 * Math.Log10(rms)) : SilenceDb;
     }
 }
+
+/// <summary>
+/// Mixes several capture sources (for example every speaker an app is playing to) into one track on the
+/// session clock. Each source stays contiguous under callback jitter and jumps only over real gaps;
+/// time nothing played becomes silence. Not thread-safe: callers serialize access.
+/// </summary>
+public sealed class TrackMixer(int sampleRate = 16_000)
+{
+    /// <summary>Gaps shorter than this are capture jitter, not silence.</summary>
+    public const double GapTolerance = 0.1;
+
+    private readonly List<float> _pending = [];
+    private readonly Dictionary<int, long?> _cursors = [];
+    private int _nextSource;
+
+    public int SampleRate { get; } = sampleRate;
+
+    /// <summary>Samples already handed out by <see cref="Take"/>; later samples before this index are dropped.</summary>
+    public long Taken { get; private set; }
+
+    public int AddSource()
+    {
+        var id = _nextSource++;
+        _cursors[id] = null;
+        return id;
+    }
+
+    public void RemoveSource(int source) => _cursors.Remove(source);
+
+    /// <param name="elapsedAtEnd">Session clock, in seconds, when the last of these samples was captured.</param>
+    public void Append(int source, ReadOnlySpan<float> samples, double elapsedAtEnd)
+    {
+        if (!_cursors.TryGetValue(source, out var cursor) || samples.IsEmpty)
+        {
+            return;
+        }
+        var expected = (long)Math.Round(elapsedAtEnd * SampleRate) - samples.Length;
+        var start = cursor is { } position && expected - position <= GapTolerance * SampleRate ? position : expected;
+        _cursors[source] = start + samples.Length;
+
+        var skip = (int)Math.Clamp(Taken - start, 0, samples.Length);
+        var offset = start + skip - Taken;
+        var needed = offset + samples.Length - skip;
+        while (_pending.Count < needed)
+        {
+            _pending.Add(0f);
+        }
+        for (var i = skip; i < samples.Length; i++)
+        {
+            _pending[(int)(offset + i - skip)] += samples[i];
+        }
+    }
+
+    /// <summary>Mixed samples from <see cref="Taken"/> up to the given clock time, clipped to [-1, 1].</summary>
+    public float[] Take(double upToElapsed)
+    {
+        var count = (long)Math.Round(upToElapsed * SampleRate) - Taken;
+        if (count <= 0)
+        {
+            return [];
+        }
+        var output = new float[count];
+        var available = (int)Math.Min(count, _pending.Count);
+        for (var i = 0; i < available; i++)
+        {
+            output[i] = Math.Clamp(_pending[i], -1f, 1f);
+        }
+        _pending.RemoveRange(0, available);
+        Taken += count;
+        return output;
+    }
+}

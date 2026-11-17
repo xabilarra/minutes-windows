@@ -45,7 +45,7 @@ Run `Minutes.exe --smoke-test 20` from a terminal (close the running Minutes fir
 ## 🧠 How it works
 
 - **Detection** reads the registry Windows keeps for its microphone privacy indicator (`CapabilityAccessManager\ConsentStore\microphone`) every second and matches the apps using the microphone against known meeting apps. Browsers count only when a window title looks like a meeting.
-- **Audio**: WASAPI captures the default microphone and, through loopback, the default speakers, both resampled to 16 kHz mono and aligned on one clock (loopback sends nothing while the PC is silent, so the gaps are filled with silence). Headphones plugged in mid-call are followed.
+- **Audio** does not depend on how your devices are configured: every 2 seconds Minutes asks Windows which microphones and outputs other apps are using right now (their active audio sessions) and records all of them through WASAPI, mixed into one 16 kHz mono track each. **Yo** is every microphone another app (Teams, Chrome…) is capturing, or the default one when none is; **Ellos** is every output an app is playing to, plus the default output. Switching headphones mid-call is followed, and silences are kept on one clock so both tracks stay aligned.
 - **Transcription** runs after the call with Groq `whisper-large-v3`: only the speech of each track is uploaded, in chunks of up to 10 minutes; failed meetings keep their audio and can be retried, and already transcribed chunks are not sent again.
 - **Final audio** is encoded to AAC with Media Foundation.
 

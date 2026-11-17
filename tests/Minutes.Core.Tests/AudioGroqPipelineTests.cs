@@ -348,3 +348,54 @@ public class TranscriptionPipelineTests
         Assert.Contains("- Audio: yo.wav (Yo), ellos.wav (Ellos)", File.ReadAllText(System.IO.Path.Combine(folder, MeetingFile.TranscriptMarkdown)));
     }
 }
+
+public class TrackMixerTests
+{
+    private static float[] Ones(int count, float value = 0.25f) => Enumerable.Repeat(value, count).ToArray();
+
+    [Fact]
+    public void MixesSourcesOnOneTimelineAndFillsSilence()
+    {
+        var mixer = new TrackMixer(sampleRate: 100);
+        var mic = mixer.AddSource();
+        var headset = mixer.AddSource();
+        mixer.Append(mic, Ones(10), elapsedAtEnd: 0.1);      // samples 0-9
+        mixer.Append(headset, Ones(10), elapsedAtEnd: 0.15); // samples 5-14
+        var mixed = mixer.Take(upToElapsed: 0.2);
+        Assert.Equal(20, mixed.Length);
+        Assert.Equal(0.25f, mixed[0]);
+        Assert.Equal(0.5f, mixed[7]);
+        Assert.Equal(0.25f, mixed[12]);
+        Assert.Equal(0f, mixed[17]);
+        Assert.Equal(20, mixer.Taken);
+    }
+
+    [Fact]
+    public void KeepsEachSourceContiguousUnderJitterAndJumpsRealGaps()
+    {
+        var mixer = new TrackMixer(sampleRate: 100);
+        var source = mixer.AddSource();
+        mixer.Append(source, Ones(10), 0.10);
+        mixer.Append(source, Ones(10), 0.22); // 2 samples of jitter: stays contiguous (10-19)
+        mixer.Append(source, Ones(10), 0.60); // real gap: placed at 50-59
+        var mixed = mixer.Take(0.6);
+        Assert.All(mixed[..20], sample => Assert.Equal(0.25f, sample));
+        Assert.All(mixed[20..50], sample => Assert.Equal(0f, sample));
+        Assert.All(mixed[50..60], sample => Assert.Equal(0.25f, sample));
+    }
+
+    [Fact]
+    public void DropsLateSamplesAndClipsTheSum()
+    {
+        var mixer = new TrackMixer(sampleRate: 100);
+        var a = mixer.AddSource();
+        var b = mixer.AddSource();
+        Assert.Equal(10, mixer.Take(0.1).Length);
+        mixer.Append(a, Ones(20, 0.8f), 0.15);  // samples -5..14: the first 5 are already written
+        mixer.Append(b, Ones(5, 0.8f), 0.15);   // samples 10-14
+        mixer.RemoveSource(b);
+        var mixed = mixer.Take(0.15);
+        Assert.Equal(5, mixed.Length);
+        Assert.All(mixed, sample => Assert.Equal(1f, sample));
+    }
+}
