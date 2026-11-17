@@ -21,6 +21,10 @@ internal sealed class RecordingCoordinator : IDisposable
     private bool _isStarting;
     private bool _sessionStopsWithMic;
     private Task _finalizing = Task.CompletedTask;
+    private Task _startup = Task.CompletedTask;
+
+    /// <summary>Blocks until meetings left pending by an earlier run are queued (smoke test).</summary>
+    public void WaitForStartup() => _startup.Wait(TimeSpan.FromSeconds(30));
 
     public AppSettings Settings { get; private set; } = AppSettings.Load();
     public RecordingSession? Session { get; private set; }
@@ -53,7 +57,8 @@ internal sealed class RecordingCoordinator : IDisposable
     {
         LoadLastMeeting();
         // Detection starts only after the pending scan, so a new recording is never queued half-written.
-        Task.Run(_pipeline.ResumePending).ContinueWith(_ => OnUi(() =>
+        _startup = Task.Run(_pipeline.ResumePending);
+        _startup.ContinueWith(_ => OnUi(() =>
         {
             if (autoDetect)
             {
@@ -157,7 +162,13 @@ internal sealed class RecordingCoordinator : IDisposable
         _isStarting = true;
         try
         {
-            Session = RecordingSession.Start(appName, appKey, windowTitle, title, trigger, Settings.MeetingsRoot);
+            Session = RecordingSession.Start(appName, appKey, windowTitle, title, trigger, Settings.MeetingsRoot,
+                message => OnUi(() =>
+                {
+                    LastProblem = message;
+                    Problem?.Invoke("Grabación incompleta", message);
+                    Changed?.Invoke();
+                }));
             _sessionStopsWithMic = false;
             LastProblem = Session.Warnings.Count == 0 ? null : string.Join(" ", Session.Warnings);
             if (LastProblem is not null)

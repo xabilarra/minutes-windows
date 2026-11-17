@@ -10,6 +10,7 @@ internal sealed class RecordingSession
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly List<TrackRecorder> _tracks = [];
     private MeetingMetadata _metadata;
+    private Action<string> _onTrackFailed = _ => { };
 
     public string Folder { get; }
     public DateTimeOffset StartedAt { get; }
@@ -24,7 +25,8 @@ internal sealed class RecordingSession
     }
 
     /// <summary>Creates the meeting folder and starts both tracks; throws when neither track can record.</summary>
-    public static RecordingSession Start(string appName, string? appKey, string? windowTitle, string? title, string trigger, string root)
+    public static RecordingSession Start(
+        string appName, string? appKey, string? windowTitle, string? title, string trigger, string root, Action<string> onTrackFailed)
     {
         Directory.CreateDirectory(root);
         var startedAt = DateTimeOffset.Now;
@@ -42,7 +44,7 @@ internal sealed class RecordingSession
         };
         MetadataStore.Write(metadata, folder);
 
-        var session = new RecordingSession(folder, metadata);
+        var session = new RecordingSession(folder, metadata) { _onTrackFailed = onTrackFailed };
         session.StartTrack("Yo (micrófono)", MeetingFile.MicRaw, loopback: false);
         session.StartTrack("Ellos (audio del PC)", MeetingFile.SystemRaw, loopback: true);
         if (session._tracks.Count == 0)
@@ -67,6 +69,7 @@ internal sealed class RecordingSession
         try
         {
             track = new TrackRecorder(name, Path.Combine(Folder, file), loopback, _clock);
+            track.Failed += message => _onTrackFailed(message);
             track.Start();
             _tracks.Add(track);
         }

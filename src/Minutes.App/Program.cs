@@ -73,6 +73,7 @@ internal static class SmokeTest
         ui.CreateControl();
         using var coordinator = new RecordingCoordinator(ui);
         coordinator.Start(autoDetect: false);
+        coordinator.WaitForStartup();
         coordinator.StartManualRecording();
         if (coordinator.Session is null)
         {
@@ -84,6 +85,9 @@ internal static class SmokeTest
         {
             var label = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, Font = new Font("Segoe UI", 10f) };
             progress.Controls.Add(label);
+            var done = false;
+            // Closing early would leave the recording running and report a missing transcript.
+            progress.FormClosing += (_, e) => e.Cancel = !done;
             var started = DateTime.UtcNow;
             var timer = new System.Windows.Forms.Timer { Interval = 250 };
             timer.Tick += (_, _) =>
@@ -98,7 +102,11 @@ internal static class SmokeTest
                 {
                     coordinator.StopRecording(manual: true);
                     label.Text = "Transcribiendo…";
-                    coordinator.WhenIdleAsync().ContinueWith(_ => progress.BeginInvoke(progress.Close));
+                    coordinator.WhenIdleAsync().ContinueWith(_ => progress.BeginInvoke(() =>
+                    {
+                        done = true;
+                        progress.Close();
+                    }));
                 }
             };
             timer.Start();

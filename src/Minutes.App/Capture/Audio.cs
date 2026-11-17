@@ -30,6 +30,9 @@ internal sealed class TrackRecorder : IDisposable
     public string Name { get; }
     public long FramesWritten => _writer.FramesWritten;
 
+    /// <summary>Raised (on a worker thread) when the track stopped recording for good.</summary>
+    public event Action<string>? Failed;
+
     public TrackRecorder(string name, string path, bool loopback, Stopwatch clock)
     {
         Name = name;
@@ -110,7 +113,7 @@ internal sealed class TrackRecorder : IDisposable
             MinutesLog.Error($"{Name}: capture stopped: {args.Exception.GetType().Name}: {args.Exception.Message}");
             if (!_stopping && sender == _capture)
             {
-                _ = Task.Delay(1000).ContinueWith(_ => Restart());
+                _ = Task.Run(Restart);
             }
         }
     }
@@ -130,21 +133,29 @@ internal sealed class TrackRecorder : IDisposable
         MinutesLog.Info($"{Name}: default device changed, restarting capture");
         // Disposed outside the lock: disposing joins the capture thread, which may be waiting for it in OnData.
         DisposeCapture(old);
-        lock (_lock)
+        // The new endpoint is often not ready when the notification fires: retry before giving up.
+        int[] delays = [0, 1000, 2000, 4000, 8000];
+        foreach (var delay in delays)
         {
-            if (_stopping || _capture is not null)
+            Thread.Sleep(delay);
+            lock (_lock)
             {
-                return;
-            }
-            try
-            {
-                StartCapture();
-            }
-            catch (Exception error)
-            {
-                MinutesLog.Error($"{Name}: restart failed: {error.GetType().Name}: {error.Message}");
+                if (_stopping || _capture is not null)
+                {
+                    return;
+                }
+                try
+                {
+                    StartCapture();
+                    return;
+                }
+                catch (Exception error)
+                {
+                    MinutesLog.Error($"{Name}: restart failed: {error.GetType().Name}: {error.Message}");
+                }
             }
         }
+        Failed?.Invoke($"Se ha dejado de grabar {Name} tras cambiar de dispositivo de audio.");
     }
 
     /// <summary>Stops capturing and pads the track to the session length.</summary>

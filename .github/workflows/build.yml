@@ -67,7 +67,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest Minutes.exe --title "Minutes for Windows (latest build)" \
-            --notes "Build of $SHA. Download Minutes.exe and open it: see the README for first-run steps." \
-            --prerelease --target "$SHA"
+          notes="Build of $SHA. Download Minutes.exe and open it: see the README for first-run steps."
+          if gh release view latest >/dev/null 2>&1; then
+            # Replace in place so the download link never disappears: move the tag, then the asset.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" -f sha="$SHA" -F force=true >/dev/null
+            gh release upload latest Minutes.exe --clobber
+            gh release edit latest --notes "$notes"
+          else
+            gh release create latest Minutes.exe --title "Minutes for Windows (latest build)" \
+              --notes "$notes" --prerelease --target "$SHA"
+          fi
