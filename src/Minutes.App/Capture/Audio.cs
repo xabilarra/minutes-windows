@@ -15,6 +15,7 @@ namespace Minutes.App.Capture;
 internal sealed class TrackRecorder : IDisposable
 {
     private readonly bool _loopback;
+    private readonly Role _role;
     private readonly Stopwatch _clock;
     private readonly AlignedTrackWriter _writer;
     private readonly object _lock = new();
@@ -33,13 +34,18 @@ internal sealed class TrackRecorder : IDisposable
     /// <summary>Raised (on a worker thread) when the track stopped recording for good.</summary>
     public event Action<string>? Failed;
 
-    public TrackRecorder(string name, string path, bool loopback, Stopwatch clock)
+    /// <param name="communications">
+    /// Record the default communications device (what Teams, Zoom and other call apps use by default)
+    /// instead of the default device (what browsers use).
+    /// </param>
+    public TrackRecorder(string name, string path, bool loopback, bool communications, Stopwatch clock)
     {
         Name = name;
         _loopback = loopback;
+        _role = communications ? Role.Communications : Role.Console;
         _clock = clock;
         _writer = new AlignedTrackWriter(path);
-        _listener = new DeviceChangeListener(loopback ? DataFlow.Render : DataFlow.Capture, () => Task.Run(Restart));
+        _listener = new DeviceChangeListener(loopback ? DataFlow.Render : DataFlow.Capture, _role, () => Task.Run(Restart));
     }
 
     public void Start()
@@ -53,7 +59,8 @@ internal sealed class TrackRecorder : IDisposable
 
     private void StartCapture()
     {
-        var capture = _loopback ? new WasapiLoopbackCapture() : new WasapiCapture();
+        var device = _enumerator.GetDefaultAudioEndpoint(_loopback ? DataFlow.Render : DataFlow.Capture, _role);
+        WasapiCapture capture = _loopback ? new WasapiLoopbackCapture(device) : new WasapiCapture(device);
         var wave = capture.WaveFormat;
         var isFloat = wave.Encoding == WaveFormatEncoding.IeeeFloat
             || (wave is WaveFormatExtensible extensible && extensible.SubFormat == IeeeFloatSubtype);
@@ -63,29 +70,7 @@ internal sealed class TrackRecorder : IDisposable
         capture.RecordingStopped += OnStopped;
         capture.StartRecording();
         _capture = capture;
-        MinutesLog.Info($"{Name}: capturing {wave.SampleRate} Hz, {wave.Channels} ch, {wave.BitsPerSample} bit, float={isFloat}");
-        LogCommunicationsDevice();
-    }
-
-    /// <summary>
-    /// Meeting apps often use the default communications device; when it differs from the default device
-    /// recorded here, one track may come out silent, so the log says so.
-    /// </summary>
-    private void LogCommunicationsDevice()
-    {
-        try
-        {
-            var flow = _loopback ? DataFlow.Render : DataFlow.Capture;
-            var console = _enumerator.GetDefaultAudioEndpoint(flow, Role.Console);
-            var communications = _enumerator.GetDefaultAudioEndpoint(flow, Role.Communications);
-            if (console.ID != communications.ID)
-            {
-                MinutesLog.Info($"{Name}: recording the default device; the communications device is a different one");
-            }
-        }
-        catch (Exception)
-        {
-        }
+        MinutesLog.Info($"{Name}: capturing \"{device.FriendlyName}\" ({_role}) at {wave.SampleRate} Hz, {wave.Channels} ch, {wave.BitsPerSample} bit, float={isFloat}");
     }
 
     private void OnData(object? sender, WaveInEventArgs args)
@@ -212,12 +197,15 @@ internal sealed class TrackRecorder : IDisposable
         _enumerator.Dispose();
     }
 
-    /// <summary>Calls back when the default device of one direction changes.</summary>
-    private sealed class DeviceChangeListener(DataFlow flow, Action onChange) : IMMNotificationClient
+    /// <summary>Calls back when the recorded default device (direction and role) changes.</summary>
+    private sealed class DeviceChangeListener(DataFlow flow, Role recordedRole, Action onChange) : IMMNotificationClient
     {
         public void OnDefaultDeviceChanged(DataFlow changedFlow, Role role, string defaultDeviceId)
         {
-            if (changedFlow == flow && role is Role.Console or Role.Multimedia)
+            var matches = recordedRole == Role.Communications
+                ? role == Role.Communications
+                : role is Role.Console or Role.Multimedia;
+            if (changedFlow == flow && matches)
             {
                 onChange();
             }

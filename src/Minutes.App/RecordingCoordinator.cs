@@ -133,7 +133,7 @@ internal sealed class RecordingCoordinator : IDisposable
         var foreground = WindowCatalog.Foreground();
         var isOwnWindow = foreground is { } own && own.Pid == Environment.ProcessId;
         var name = foreground is { } window && !isOwnWindow ? WindowCatalog.ProductName(window.Pid) : "Manual";
-        StartRecording(name, isOwnWindow ? null : foreground?.Process, isOwnWindow ? null : foreground?.Title, title: null, "manual");
+        StartRecording(name, isOwnWindow ? null : foreground?.Process, isOwnWindow ? null : foreground?.Title, title: null, "manual", communications: false);
     }
 
     private bool StartRecording(MeetingApp app, IReadOnlySet<string> keys, string trigger)
@@ -145,7 +145,9 @@ internal sealed class RecordingCoordinator : IDisposable
             app = app.Renamed(service);
         }
         var key = keys.FirstOrDefault(app.MatchesMicKey);
-        var started = StartRecording(app.DisplayName, key, window?.Title, MeetingTitle.Clean(window?.Title, app), trigger);
+        var started = StartRecording(app.DisplayName, key, window?.Title, MeetingTitle.Clean(window?.Title, app), trigger,
+            // Call apps (Teams, Zoom…) use the communications device by default; browsers use the default device.
+            communications: !app.IsBrowser);
         if (started)
         {
             _sessionStopsWithMic = trigger == "auto";
@@ -153,7 +155,7 @@ internal sealed class RecordingCoordinator : IDisposable
         return started;
     }
 
-    private bool StartRecording(string appName, string? appKey, string? windowTitle, string? title, string trigger)
+    private bool StartRecording(string appName, string? appKey, string? windowTitle, string? title, string trigger, bool communications)
     {
         if (Session is not null || _isStarting)
         {
@@ -162,7 +164,7 @@ internal sealed class RecordingCoordinator : IDisposable
         _isStarting = true;
         try
         {
-            Session = RecordingSession.Start(appName, appKey, windowTitle, title, trigger, Settings.MeetingsRoot,
+            Session = RecordingSession.Start(appName, appKey, windowTitle, title, trigger, Settings.MeetingsRoot, communications,
                 message => OnUi(() =>
                 {
                     LastProblem = message;
