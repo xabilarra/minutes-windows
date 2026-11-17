@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Minutes.App/Minutes.App.csproj" />
     <Project Path="src/Minutes.Core/Minutes.Core.csproj" />
   </Folder>
   <Folder Name="/tests/">

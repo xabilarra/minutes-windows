@@ -246,13 +246,24 @@ public class TranscriptionPipelineTests
         return folder;
     }
 
-    private static TranscriptionPipeline Make(string root, FakeHandler handler, string? key, List<string?> failures) => new(
+    private sealed class BrokenExporter : IFinalAudioExporter
+    {
+        public void Export(string rawWav, string destinationM4a)
+        {
+            File.WriteAllText(destinationM4a, "partial");
+            throw new InvalidOperationException("no AAC encoder");
+        }
+
+        public double Duration(string path) => 0;
+    }
+
+    private static TranscriptionPipeline Make(string root, FakeHandler handler, string? key, List<string?> failures, IFinalAudioExporter? exporter = null) => new(
         root,
         () => key,
         () => "es",
         () => "Mobilia",
         apiKey => new GroqClient(apiKey, new HttpClient(handler), sleeper: (_, _) => Task.CompletedTask),
-        new CopyExporter(),
+        exporter ?? new CopyExporter(),
         _ => { },
         (_, failure) => failures.Add(failure));
 
@@ -315,5 +326,25 @@ public class TranscriptionPipelineTests
         pipeline.ResumePending();
         await pipeline.Idle;
         Assert.StartsWith("Falta la clave de Groq", failures.Single());
+    }
+
+    [Fact]
+    public async Task AFailingAudioExportStillWritesTheTranscriptAndKeepsTheRawTracks()
+    {
+        using var temp = new TempDirectory();
+        var folder = MakeMeeting(temp.Path);
+        var handler = new FakeHandler()
+            .Reply(HttpStatusCode.OK, """{"segments":[{"start":0.2,"end":1.5,"text":"Hola"}]}""")
+            .Reply(HttpStatusCode.OK, """{"segments":[{"start":0.2,"end":1.5,"text":"Adiós"}]}""");
+        var failures = new List<string?>();
+        var pipeline = Make(temp.Path, handler, "gsk_x", failures, new BrokenExporter());
+        pipeline.Enqueue(folder);
+        await pipeline.Idle;
+
+        Assert.Equal([null], failures);
+        Assert.Equal(TranscriptionState.Done, MetadataStore.Read(folder).Transcription.State);
+        Assert.True(File.Exists(System.IO.Path.Combine(folder, MeetingFile.MicRaw)));
+        Assert.False(File.Exists(System.IO.Path.Combine(folder, MeetingFile.MicAudio)));
+        Assert.Contains("- Audio: yo.wav (Yo), ellos.wav (Ellos)", File.ReadAllText(System.IO.Path.Combine(folder, MeetingFile.TranscriptMarkdown)));
     }
 }

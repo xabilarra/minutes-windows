@@ -183,15 +183,17 @@ public sealed class TranscriptionPipeline
             var segments = vocabulary.Correct(TranscriptAssembler.Assemble(me, them));
 
             // Raw tracks are deleted last: any failure before this point leaves everything retryable.
-            ExportVerifiedAudio(folder);
+            var exported = ExportVerifiedAudio(folder);
+            var micFile = exported.Contains(MeetingFile.MicRaw) ? MeetingFile.MicAudio : MeetingFile.MicRaw;
+            var systemFile = exported.Contains(MeetingFile.SystemRaw) ? MeetingFile.SystemAudio : MeetingFile.SystemRaw;
             metadata = metadata with
             {
                 Transcription = new(TranscriptionState.Done, GroqClient.DefaultModel, storedLanguage, completedAt: DateTimeOffset.UtcNow),
             };
-            AtomicFile.WriteAllText(Path.Combine(folder, MeetingFile.TranscriptMarkdown), TranscriptRenderer.Markdown(segments, metadata));
+            AtomicFile.WriteAllText(Path.Combine(folder, MeetingFile.TranscriptMarkdown), TranscriptRenderer.Markdown(segments, metadata, micFile: micFile, systemFile: systemFile));
             AtomicFile.WriteAllText(Path.Combine(folder, MeetingFile.TranscriptJson), TranscriptRenderer.Json(segments, metadata));
             MetadataStore.Write(metadata, folder);
-            RemoveRawAudio(folder);
+            RemoveRawAudio(folder, exported);
             cache.Remove();
             MinutesLog.Info($"Transcribed a meeting: {segments.Count} segments");
             return null;
@@ -291,9 +293,14 @@ public sealed class TranscriptionPipeline
         }
     }
 
-    /// <summary>Converts every raw track to its final m4a and checks the durations match. Deletes nothing.</summary>
-    private void ExportVerifiedAudio(string folder)
+    /// <summary>
+    /// Converts every raw track to its final m4a and checks the durations match. Deletes no raw track.
+    /// A track that fails keeps its raw WAV (logged, not fatal: the transcript matters more than the format).
+    /// Returns the raw tracks whose m4a is verified.
+    /// </summary>
+    private HashSet<string> ExportVerifiedAudio(string folder)
     {
+        var exported = new HashSet<string>();
         foreach (var (raw, final) in Tracks)
         {
             var rawPath = Path.Combine(folder, raw);
@@ -302,19 +309,35 @@ public sealed class TranscriptionPipeline
                 continue;
             }
             var finalPath = Path.Combine(folder, final);
-            _exporter.Export(rawPath, finalPath);
-            var rawDuration = WavFile.Open(rawPath).Duration;
-            var finalDuration = _exporter.Duration(finalPath);
-            if (Math.Abs(rawDuration - finalDuration) >= 1.0)
+            try
             {
-                throw new PipelineException($"El archivo {final} exportado no coincide con la duración grabada; se ha conservado el audio original.");
+                _exporter.Export(rawPath, finalPath);
+                var rawDuration = WavFile.Open(rawPath).Duration;
+                var finalDuration = _exporter.Duration(finalPath);
+                if (Math.Abs(rawDuration - finalDuration) >= 1.0)
+                {
+                    throw new PipelineException($"{final} lasts {finalDuration:F1} s instead of {rawDuration:F1} s");
+                }
+                exported.Add(raw);
+            }
+            catch (Exception error)
+            {
+                MinutesLog.Error($"Keeping {raw}: export to {final} failed: {error.GetType().Name}: {error.Message}");
+                try
+                {
+                    File.Delete(finalPath);
+                }
+                catch (Exception)
+                {
+                }
             }
         }
+        return exported;
     }
 
-    private static void RemoveRawAudio(string folder)
+    private static void RemoveRawAudio(string folder, HashSet<string> exported)
     {
-        foreach (var (raw, _) in Tracks)
+        foreach (var raw in exported)
         {
             try
             {

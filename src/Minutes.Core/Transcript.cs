@@ -367,7 +367,9 @@ public static class TranscriptRenderer
     internal const double TurnJoinGap = 2.0;
     internal const string EmptyTranscriptLine = "_Sin transcripción (no se detectó voz)._";
 
-    public static string Markdown(IReadOnlyList<TranscriptSegment> segments, MeetingMetadata metadata, TimeZoneInfo? timeZone = null)
+    public static string Markdown(
+        IReadOnlyList<TranscriptSegment> segments, MeetingMetadata metadata, TimeZoneInfo? timeZone = null,
+        string micFile = MeetingFile.MicAudio, string systemFile = MeetingFile.SystemAudio)
     {
         var title = metadata.Title is { } raw && SingleLine(raw) is { Length: > 0 } clean ? clean : metadata.AppName;
         var started = LocalDateFormat.Format(metadata.StartedAt, "yyyy-MM-dd HH:mm", timeZone ?? TimeZoneInfo.Local);
@@ -382,7 +384,7 @@ public static class TranscriptRenderer
         {
             lines.Add($"- Vídeo: {MeetingFile.Video} (desfase {SignedTenths(metadata.VideoOffsetSeconds)} s)");
         }
-        lines.Add($"- Audio: {MeetingFile.MicAudio} ({SpeakerLabel.Of(Speaker.Me)}), {MeetingFile.SystemAudio} ({SpeakerLabel.Of(Speaker.Them)})");
+        lines.Add($"- Audio: {micFile} ({SpeakerLabel.Of(Speaker.Me)}), {systemFile} ({SpeakerLabel.Of(Speaker.Them)})");
         lines.Add("");
         lines.Add("## Transcripción");
         lines.Add("");
