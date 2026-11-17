@@ -399,3 +399,77 @@ public class TrackMixerTests
         Assert.All(mixed, sample => Assert.Equal(1f, sample));
     }
 }
+
+public class TrackMixerDriftTests
+{
+    [Fact]
+    public void ReanchorsASourceThatRunsAheadOfTheClock()
+    {
+        var mixer = new TrackMixer(sampleRate: 100);
+        var source = mixer.AddSource();
+        mixer.Append(source, Enumerable.Repeat(0.25f, 50).ToArray(), 0.5);  // 0-49
+        mixer.Append(source, Enumerable.Repeat(0.25f, 50).ToArray(), 0.8);  // device ran fast: expected 30-79, cursor at 50
+        var mixed = mixer.Take(0.8);
+        Assert.Equal(80, mixed.Length);
+        Assert.All(mixed[..30], sample => Assert.Equal(0.25f, sample));
+        Assert.All(mixed[30..50], sample => Assert.Equal(0.5f, sample));
+        Assert.All(mixed[50..80], sample => Assert.Equal(0.25f, sample));
+    }
+}
+
+public class DeviceSelectionTests
+{
+    private const uint Own = 1, Teams = 10, TeamsWebView = 11, Krisp = 20, Chrome = 30;
+    private static readonly HashSet<uint> TeamsTree = [Teams, TeamsWebView];
+
+    private static IReadOnlyList<string> Choose(
+        AudioSessionInfo[] sessions, HashSet<uint>? app = null, string[]? recorded = null, string[]? defaults = null, bool alwaysDefaults = false) =>
+        DeviceSelection.Choose(sessions, app ?? [], Own, recorded ?? [], defaults ?? ["default"], alwaysDefaults);
+
+    [Fact]
+    public void TheMeetingAppsActiveDevicesWin()
+    {
+        var sessions = new[]
+        {
+            new AudioSessionInfo("krisp-virtual", TeamsWebView, IsActive: true),
+            new AudioSessionInfo("headset", Krisp, IsActive: true),
+            new AudioSessionInfo("webcam", Chrome, IsActive: true),
+            new AudioSessionInfo("laptop", Teams, IsActive: false),
+        };
+        Assert.Equal(["krisp-virtual"], Choose(sessions, TeamsTree, alwaysDefaults: true));
+    }
+
+    [Fact]
+    public void WhileTheAppIsMutedOneInactiveDeviceIsKept()
+    {
+        var sessions = new[]
+        {
+            new AudioSessionInfo("headset", Teams, IsActive: false),
+            new AudioSessionInfo("laptop", TeamsWebView, IsActive: false),
+            new AudioSessionInfo("webcam", Chrome, IsActive: true),
+        };
+        Assert.Equal(["laptop"], Choose(sessions, TeamsTree, recorded: ["laptop"]));
+        Assert.Equal(["headset"], Choose(sessions, TeamsTree, defaults: ["headset"]));
+        Assert.Equal(["headset"], Choose(sessions, TeamsTree, defaults: ["other"]));
+    }
+
+    [Fact]
+    public void WithoutTheAppOtherAppsActiveDevicesCountAndOwnSessionsDoNot()
+    {
+        var sessions = new[]
+        {
+            new AudioSessionInfo("webcam", Chrome, IsActive: true),
+            new AudioSessionInfo("headset", Own, IsActive: true),
+            new AudioSessionInfo("laptop", Chrome, IsActive: false),
+        };
+        Assert.Equal(["webcam"], Choose(sessions));
+        Assert.Equal(["webcam", "default", "comms"], Choose(sessions, defaults: ["default", "comms"], alwaysDefaults: true));
+    }
+
+    [Fact]
+    public void NothingInUseFallsBackToTheDefaults()
+    {
+        Assert.Equal(["default"], Choose([new AudioSessionInfo("headset", Own, IsActive: true)]));
+        Assert.Empty(Choose([], defaults: []));
+    }
+}

@@ -449,7 +449,9 @@ public sealed class TrackMixer(int sampleRate = 16_000)
             return;
         }
         var expected = (long)Math.Round(elapsedAtEnd * SampleRate) - samples.Length;
-        var start = cursor is { } position && expected - position <= GapTolerance * SampleRate ? position : expected;
+        // Contiguous within the tolerance either way; beyond it (a gap, or a device clock running ahead of
+        // the session clock) the source is re-anchored so drift never accumulates.
+        var start = cursor is { } position && Math.Abs(expected - position) <= GapTolerance * SampleRate ? position : expected;
         _cursors[source] = start + samples.Length;
 
         var skip = (int)Math.Clamp(Taken - start, 0, samples.Length);
@@ -483,4 +485,51 @@ public sealed class TrackMixer(int sampleRate = 16_000)
         Taken += count;
         return output;
     }
+}
+
+/// <summary>One audio session on an endpoint: who opened it and whether it is streaming now.</summary>
+public sealed record AudioSessionInfo(string DeviceId, uint ProcessId, bool IsActive);
+
+/// <summary>Which endpoints a track records, from the audio sessions Windows reports.</summary>
+public static class DeviceSelection
+{
+    /// <summary>
+    /// In order of preference: the devices the meeting app's process tree streams on; while it is muted, one
+    /// of the devices it keeps open (the one already recorded, else the first default, else the first); otherwise
+    /// the devices other apps stream on, plus the defaults when <paramref name="alwaysIncludeDefaults"/> (speakers)
+    /// or when nothing else is in use. Sessions of Minutes itself never count.
+    /// </summary>
+    /// <param name="defaults">Default device ids in order of preference (missing ones omitted).</param>
+    public static IReadOnlyList<string> Choose(
+        IEnumerable<AudioSessionInfo> sessions,
+        IReadOnlySet<uint> appProcesses,
+        uint ownProcessId,
+        IReadOnlyCollection<string> recorded,
+        IReadOnlyList<string> defaults,
+        bool alwaysIncludeDefaults)
+    {
+        var foreign = sessions.Where(session => session.ProcessId != ownProcessId).ToList();
+        var appActive = Distinct(foreign.Where(session => session.IsActive && appProcesses.Contains(session.ProcessId)));
+        if (appActive.Count > 0)
+        {
+            return appActive;
+        }
+        var appInactive = Distinct(foreign.Where(session => !session.IsActive && appProcesses.Contains(session.ProcessId)));
+        if (appInactive.Count > 0)
+        {
+            var keep = appInactive.FirstOrDefault(recorded.Contains)
+                ?? appInactive.FirstOrDefault(id => defaults.Count > 0 && id == defaults[0])
+                ?? appInactive[0];
+            return [keep];
+        }
+        var chosen = Distinct(foreign.Where(session => session.IsActive));
+        if (alwaysIncludeDefaults || chosen.Count == 0)
+        {
+            chosen.AddRange(defaults.Where(id => !chosen.Contains(id)).Distinct());
+        }
+        return chosen;
+    }
+
+    private static List<string> Distinct(IEnumerable<AudioSessionInfo> sessions) =>
+        sessions.Select(session => session.DeviceId).Distinct().ToList();
 }

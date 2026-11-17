@@ -144,7 +144,7 @@ internal sealed class TrackRecorder : IDisposable
             MinutesLog.Info($"{Name}: stopped recording \"{capture.DeviceName}\"{(capture.HasFailed ? " (device failed)" : "")}");
             capture.Dispose();
         }
-        foreach (var (id, device) in wanted)
+        foreach (var (id, deviceName) in wanted)
         {
             lock (_lock)
             {
@@ -156,7 +156,8 @@ internal sealed class TrackRecorder : IDisposable
             DeviceCapture? started = null;
             try
             {
-                started = new DeviceCapture(device, _loopback, this);
+                // A fresh device object owned by the capture; the scan's own objects are already released.
+                started = new DeviceCapture(_enumerator!.GetDevice(id), _loopback, this);
                 lock (_lock)
                 {
                     if (_stopping)
@@ -173,7 +174,7 @@ internal sealed class TrackRecorder : IDisposable
             }
             catch (Exception error)
             {
-                LogDeviceError(id, $"{Name}: could not open \"{device.FriendlyName}\": {error.GetType().Name}: {error.Message}");
+                LogDeviceError(id, $"{Name}: could not open \"{deviceName}\": {error.GetType().Name}: {error.Message}");
                 lock (_lock)
                 {
                     if (started is not null && _captures.TryGetValue(id, out var current) && current == started)
@@ -203,126 +204,82 @@ internal sealed class TrackRecorder : IDisposable
     }
 
     /// <summary>
-    /// Device id → device for every endpoint this track should record now, in order of preference:
-    /// 1. the devices the meeting app's process tree is streaming on (Active), or keeps open while muted (Inactive);
-    /// 2. otherwise the devices any other app is streaming on, plus (speakers) the default outputs;
-    /// 3. otherwise the default device (microphone: communications for call apps).
+    /// Device id → name of every endpoint this track should record now (see <see cref="DeviceSelection.Choose"/>).
+    /// Every COM object read here is released before returning: a scan runs every 2 s for hours.
     /// </summary>
-    private Dictionary<string, MMDevice> WantedDevices()
+    private Dictionary<string, string> WantedDevices()
     {
         var flow = _loopback ? DataFlow.Render : DataFlow.Capture;
         _enumerator ??= new MMDeviceEnumerator();
-        var appTree = ProcessTree.Of(_appProcesses);
-        var appActive = new Dictionary<string, MMDevice>();
-        var appInactive = new Dictionary<string, MMDevice>();
-        var othersActive = new Dictionary<string, MMDevice>();
+        var sessions = new List<AudioSessionInfo>();
+        var names = new Dictionary<string, string>();
         foreach (var device in _enumerator.EnumerateAudioEndPoints(flow, DeviceState.Active))
         {
-            foreach (var (processId, state) in Sessions(device))
+            using (device)
             {
-                if (processId == _ownProcessId)
-                {
-                    continue;
-                }
-                var isApp = appTree.Contains(processId);
-                if (isApp && state == AudioSessionState.AudioSessionStateActive)
-                {
-                    appActive[device.ID] = device;
-                }
-                else if (isApp && state == AudioSessionState.AudioSessionStateInactive)
-                {
-                    appInactive[device.ID] = device;
-                }
-                else if (state == AudioSessionState.AudioSessionStateActive)
-                {
-                    othersActive[device.ID] = device;
-                }
+                names[device.ID] = SafeName(device);
+                ReadSessions(device, sessions);
             }
         }
-        if (appActive.Count > 0)
+        var defaults = new List<string>();
+        foreach (var role in _loopback ? new[] { Role.Console, _fallbackRole } : [_fallbackRole])
         {
-            return appActive;
-        }
-        if (appInactive.Count > 0)
-        {
-            return OneInactiveDevice(appInactive, flow);
-        }
-        var wanted = othersActive;
-        // Speakers: the default outputs always count. Microphone: the default input only when no app uses one.
-        if (_loopback || wanted.Count == 0)
-        {
-            foreach (var role in _loopback ? new[] { Role.Console, _fallbackRole } : [_fallbackRole])
+            try
             {
-                try
-                {
-                    var fallback = _enumerator.GetDefaultAudioEndpoint(flow, role);
-                    wanted.TryAdd(fallback.ID, fallback);
-                }
-                catch (Exception)
-                {
-                    // No default device (none plugged in): nothing to add.
-                }
+                using var fallback = _enumerator.GetDefaultAudioEndpoint(flow, role);
+                defaults.Add(fallback.ID);
+                names.TryAdd(fallback.ID, SafeName(fallback));
+            }
+            catch (Exception)
+            {
+                // No default device for this role (none plugged in).
             }
         }
-        return wanted;
-    }
-
-    /// <summary>
-    /// The app keeps Inactive sessions on devices it used earlier, so while it is muted only one of them is
-    /// kept: the one already being recorded, else the default device, else the first.
-    /// </summary>
-    private Dictionary<string, MMDevice> OneInactiveDevice(Dictionary<string, MMDevice> inactive, DataFlow flow)
-    {
-        if (inactive.Count == 1)
-        {
-            return inactive;
-        }
+        List<string> recorded;
         lock (_lock)
         {
-            var recorded = inactive.Where(pair => _captures.ContainsKey(pair.Key)).ToDictionary();
-            if (recorded.Count > 0)
-            {
-                return recorded;
-            }
+            recorded = [.. _captures.Keys];
         }
+        var chosen = DeviceSelection.Choose(
+            sessions, ProcessTree.Of(_appProcesses), _ownProcessId, recorded, defaults, alwaysIncludeDefaults: _loopback);
+        return chosen.ToDictionary(id => id, id => names.GetValueOrDefault(id, id));
+    }
+
+    private static string SafeName(MMDevice device)
+    {
         try
         {
-            var fallback = _enumerator!.GetDefaultAudioEndpoint(flow, _loopback ? Role.Console : _fallbackRole);
-            if (inactive.TryGetValue(fallback.ID, out var device))
-            {
-                return new Dictionary<string, MMDevice> { [fallback.ID] = device };
-            }
+            return device.FriendlyName;
         }
         catch (Exception)
         {
+            return device.ID;
         }
-        var first = inactive.First();
-        return new Dictionary<string, MMDevice> { [first.Key] = first.Value };
     }
 
-    /// <summary>Process id and state of every non-system audio session on the device.</summary>
-    private List<(uint ProcessId, AudioSessionState State)> Sessions(MMDevice device)
+    /// <summary>Adds the device's non-system sessions that are open (Active or Inactive, not Expired).</summary>
+    private void ReadSessions(MMDevice device, List<AudioSessionInfo> sessions)
     {
-        var result = new List<(uint, AudioSessionState)>();
         try
         {
+            // Released with the device (MMDevice.Dispose releases its session manager).
             var manager = device.AudioSessionManager;
             manager.RefreshSessions();
-            var sessions = manager.Sessions;
-            for (var i = 0; i < sessions.Count; i++)
+            var all = manager.Sessions;
+            for (var i = 0; i < all.Count; i++)
             {
-                var session = sessions[i];
-                if (!session.IsSystemSoundsSession)
+                using var session = all[i];
+                var state = session.State;
+                if (!session.IsSystemSoundsSession && state != AudioSessionState.AudioSessionStateExpired)
                 {
-                    result.Add((session.GetProcessID, session.State));
+                    sessions.Add(new AudioSessionInfo(device.ID, session.GetProcessID, state == AudioSessionState.AudioSessionStateActive));
                 }
             }
         }
         catch (Exception error)
         {
-            LogDeviceError(device.ID, $"{Name}: reading sessions of \"{device.FriendlyName}\" failed: {error.GetType().Name}");
+            LogDeviceError(device.ID, $"{Name}: reading sessions of \"{SafeName(device)}\" failed: {error.GetType().Name}");
         }
-        return result;
     }
 
     /// <summary>At most one log line per device and minute, so a broken device does not flood the log.</summary>
@@ -395,7 +352,11 @@ internal sealed class TrackRecorder : IDisposable
         _scanTimer?.Dispose();
         _flushTimer?.Dispose();
         // Wait for a scan already running (it may be opening a device) before releasing the devices.
-        _scanGate.Wait();
+        if (!_scanGate.Wait(TimeSpan.FromSeconds(5)))
+        {
+            // A driver stuck inside a scan must not hang stopping (or the UI): finish without it.
+            MinutesLog.Error($"{Name}: a device scan did not finish; stopping without waiting for it");
+        }
         // Disposed outside the lock: disposing joins each capture thread, which may be waiting for it.
         foreach (var capture in captures)
         {
@@ -425,6 +386,7 @@ internal sealed class TrackRecorder : IDisposable
         private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
 
         private readonly WasapiCapture _capture;
+        private readonly MMDevice _device;
         private readonly StreamingResampler _resampler;
         private readonly TrackRecorder _owner;
 
@@ -438,6 +400,7 @@ internal sealed class TrackRecorder : IDisposable
         public DeviceCapture(MMDevice device, bool loopback, TrackRecorder owner)
         {
             _owner = owner;
+            _device = device;
             DeviceId = device.ID;
             DeviceName = device.FriendlyName;
             _capture = loopback ? new WasapiLoopbackCapture(device) : new WasapiCapture(device);
@@ -483,6 +446,7 @@ internal sealed class TrackRecorder : IDisposable
             {
                 _capture.StopRecording();
                 _capture.Dispose();
+                _device.Dispose();
             }
             catch (Exception error)
             {

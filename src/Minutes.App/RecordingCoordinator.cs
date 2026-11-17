@@ -24,7 +24,20 @@ internal sealed class RecordingCoordinator : IDisposable
     private Task _startup = Task.CompletedTask;
 
     /// <summary>Blocks until meetings left pending by an earlier run are queued (smoke test).</summary>
-    public void WaitForStartup() => _startup.Wait(TimeSpan.FromSeconds(30));
+    public void WaitForStartup()
+    {
+        try
+        {
+            if (!_startup.Wait(TimeSpan.FromSeconds(30)))
+            {
+                MinutesLog.Error("Pending scan still running after 30 s; recording anyway");
+            }
+        }
+        catch (Exception error)
+        {
+            MinutesLog.Error($"Pending scan failed: {error.GetBaseException().GetType().Name}");
+        }
+    }
 
     public AppSettings Settings { get; private set; } = AppSettings.Load();
     public RecordingSession? Session { get; private set; }
