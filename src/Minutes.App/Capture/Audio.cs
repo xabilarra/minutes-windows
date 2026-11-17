@@ -245,7 +245,7 @@ internal sealed class TrackRecorder : IDisposable
         }
         if (appInactive.Count > 0)
         {
-            return appInactive;
+            return OneInactiveDevice(appInactive, flow);
         }
         var wanted = othersActive;
         // Speakers: the default outputs always count. Microphone: the default input only when no app uses one.
@@ -265,6 +265,39 @@ internal sealed class TrackRecorder : IDisposable
             }
         }
         return wanted;
+    }
+
+    /// <summary>
+    /// The app keeps Inactive sessions on devices it used earlier, so while it is muted only one of them is
+    /// kept: the one already being recorded, else the default device, else the first.
+    /// </summary>
+    private Dictionary<string, MMDevice> OneInactiveDevice(Dictionary<string, MMDevice> inactive, DataFlow flow)
+    {
+        if (inactive.Count == 1)
+        {
+            return inactive;
+        }
+        lock (_lock)
+        {
+            var recorded = inactive.Where(pair => _captures.ContainsKey(pair.Key)).ToDictionary();
+            if (recorded.Count > 0)
+            {
+                return recorded;
+            }
+        }
+        try
+        {
+            var fallback = _enumerator!.GetDefaultAudioEndpoint(flow, _loopback ? Role.Console : _fallbackRole);
+            if (inactive.TryGetValue(fallback.ID, out var device))
+            {
+                return new Dictionary<string, MMDevice> { [fallback.ID] = device };
+            }
+        }
+        catch (Exception)
+        {
+        }
+        var first = inactive.First();
+        return new Dictionary<string, MMDevice> { [first.Key] = first.Value };
     }
 
     /// <summary>Process id and state of every non-system audio session on the device.</summary>
